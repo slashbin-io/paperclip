@@ -16,6 +16,14 @@
 //     "cases": { "<caseId>": { "users": [], "agentKeys": ["<agentApiKeyId>"] } }
 //   }
 //
+// An entry may also list "mirrorKeys": standard agent API key UUIDs that may publish
+// git-imported documents only (paperclip#24). A mirror key is not an editor: it passes
+// assertDocumentWritable at document PUT and publish, and only for a revision whose
+// changeSummary is `import <owner>/<repo>/<path>@<40hex>`, whose document key derives
+// from that path, whose body hashes to that git blob sha, and whose document history
+// holds only such revisions. Every other route, withdraw and delete included, refuses
+// it. The same UUID in agentKeys and mirrorKeys of one entry is invalid config.
+//
 // A "cases" entry replaces the type's editors for that Case. A user is an editor
 // only through a signed-in session; board API keys act as their minting user, so
 // they are refused even for a listed user. An agent is an editor only through one
@@ -25,13 +33,14 @@
 // every Case write (503) until it is fixed; reads are never gated here.
 import type { Request } from "express";
 import { eq } from "drizzle-orm";
-import { caseIssueLinks, caseLabels, cases, type Db } from "@paperclipai/db";
+import { caseIssueLinks, caseLabels, cases, documentRevisions, type Db } from "@paperclipai/db";
 import { HttpError, conflict, forbidden, unprocessable } from "../errors.js";
+import { blobSha, keyMatchesPath, parseImportSummary } from "./git-source-ref.js";
 
 export const PROTECTED_CASE_TYPES: readonly string[] = ["company-policy"];
 export const PROTECTED_CASES_ENV = "PAPERCLIP_PROTECTED_CASES";
 
-type Editors = { users: string[]; agentKeys: string[] };
+type Editors = { users: string[]; agentKeys: string[]; mirrorKeys: string[] };
 type ProtectionConfig = { types: Record<string, Editors>; cases: Record<string, Editors> };
 
 export type CaseProtection =
@@ -46,19 +55,21 @@ function parseEditors(where: string, value: unknown): Editors {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${where} must be an object with users and agentKeys`);
   }
-  const extra = Object.keys(value).filter((k) => k !== "users" && k !== "agentKeys");
+  const extra = Object.keys(value).filter((k) => k !== "users" && k !== "agentKeys" && k !== "mirrorKeys");
   if (extra.length > 0) throw new Error(`${where} has unknown keys: ${extra.join(", ")}`);
-  const out: Editors = { users: [], agentKeys: [] };
-  for (const kind of ["users", "agentKeys"] as const) {
+  const out: Editors = { users: [], agentKeys: [], mirrorKeys: [] };
+  for (const kind of ["users", "agentKeys", "mirrorKeys"] as const) {
     const list = (value as Record<string, unknown>)[kind] ?? [];
     if (!Array.isArray(list) || list.some((id) => typeof id !== "string" || id.trim() === "")) {
       throw new Error(`${where}.${kind} must be an array of ids`);
     }
-    if (kind === "agentKeys" && list.some((id) => !UUID.test(id))) {
-      throw new Error(`${where}.agentKeys must be agent API key UUIDs`);
+    if (kind !== "users" && list.some((id) => !UUID.test(id))) {
+      throw new Error(`${where}.${kind} must be agent API key UUIDs`);
     }
-    out[kind] = kind === "agentKeys" ? (list as string[]).map((id) => id.toLowerCase()) : (list as string[]);
+    out[kind] = kind === "users" ? (list as string[]) : (list as string[]).map((id) => id.toLowerCase());
   }
+  const overlap = out.mirrorKeys.filter((id) => out.agentKeys.includes(id));
+  if (overlap.length > 0) throw new Error(`${where} lists ${overlap.join(", ")} in both agentKeys and mirrorKeys`);
   return out;
 }
 
@@ -119,6 +130,69 @@ function isEditor(req: Request, editors: Editors | null) {
       && editors.agentKeys.includes(actor.keyId.toLowerCase());
   }
   return false;
+}
+
+function isMirrorKey(req: Request, editors: Editors | null) {
+  if (!editors) return false;
+  const actor = req.actor;
+  return actor.type === "agent"
+    && actor.source === "agent_key"
+    && (!actor.keyScope || actor.keyScope.kind === "standard")
+    && typeof actor.keyId === "string"
+    && editors.mirrorKeys.includes(actor.keyId.toLowerCase());
+}
+
+function mirrorRefused(row: CaseLike, why: string) {
+  return forbidden(`Mirror key refused: ${why}`, { code: "mirror_write_refused", caseId: row.id });
+}
+
+/**
+ * The one gate for document PUT and publish. Returns "editor" for anyone isEditor
+ * admits (and for an unprotected Case), "mirror" for a listed mirror key, which the
+ * caller must then hold to assertMirrorRevision and assertMirrorHistory. Everyone
+ * else gets the existing 403 case_protected. Withdraw and every other route keep
+ * assertCaseWritable, so a mirror key is refused there by default.
+ */
+export function assertDocumentWritable(
+  protection: CaseProtection,
+  req: Request,
+  row: CaseLike,
+  _write: { key: string },
+): "editor" | "mirror" {
+  assertCaseProtectionAvailable(protection);
+  if (!isProtectedCase(protection, row)) return "editor";
+  const editors = editorsFor(protection, row);
+  if (isEditor(req, editors)) return "editor";
+  if (isMirrorKey(req, editors)) return "mirror";
+  throw forbidden("Case is protected; only its configured editors may change it", {
+    code: "case_protected",
+    caseId: row.id,
+  });
+}
+
+/** One revision is git-sourced: summary parses, the key derives from its path, the bytes hash to its sha. */
+export function isGitSourcedRevision(key: string, rev: { changeSummary: string | null; body: string }) {
+  const ref = parseImportSummary(rev.changeSummary);
+  return ref !== null && keyMatchesPath(key, ref.path) && blobSha(rev.body) === ref.sha;
+}
+
+export function assertMirrorRevision(row: CaseLike, key: string, rev: { changeSummary: string | null | undefined; body: string }) {
+  if (!isGitSourcedRevision(key, { changeSummary: rev.changeSummary ?? null, body: rev.body })) {
+    throw mirrorRefused(row, "the change is not a byte-verified git import of this document key");
+  }
+}
+
+type RevisionReader = Pick<Db, "select">;
+
+/** Judged by content, not author: every stored revision of the document must be git-sourced. Call under the key lock. */
+export async function assertMirrorHistory(db: RevisionReader, row: CaseLike, documentId: string, key: string) {
+  const revisions = await db
+    .select({ changeSummary: documentRevisions.changeSummary, body: documentRevisions.body })
+    .from(documentRevisions)
+    .where(eq(documentRevisions.documentId, documentId));
+  if (revisions.some((rev) => !isGitSourcedRevision(key, rev))) {
+    throw mirrorRefused(row, "the document has a revision that is not a git import");
+  }
 }
 
 /** Refuses every Case write while the config is invalid. Call before any Case write. */

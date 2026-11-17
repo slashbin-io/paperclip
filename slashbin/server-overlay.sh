@@ -16,6 +16,7 @@ SERVER_FILES=(
   routes/issues.ts
   routes/cases.ts
   slashbin/protected-cases.ts
+  slashbin/git-source-ref.ts
   slashbin/document-publications.ts
   slashbin/publication-sync-drainer.ts
   index.ts

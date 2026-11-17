@@ -1,5 +1,7 @@
 // Slashbin patch (EM#629): only configured editors write a protected Case.
 import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
@@ -38,6 +40,7 @@ import { projectRoutes } from "../routes/projects.js";
 import { companyService } from "../services/companies.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { PROTECTED_CASES_ENV, parseCaseProtection } from "../slashbin/protected-cases.js";
+import { blobSha, keyMatchesPath, parseImportSummary } from "../slashbin/git-source-ref.js";
 import type { StorageService } from "../storage/types.js";
 
 type Actor = Express.Request["actor"];
@@ -62,6 +65,90 @@ describe("parseCaseProtection", () => {
       JSON.stringify({ types: { "company-policy": { users: [], agents: [randomUUID()] } } }),
     ]) {
       expect(parseCaseProtection(raw).status, raw).toBe("invalid");
+    }
+  });
+});
+
+describe("mirrorKeys config", () => {
+  const key = randomUUID();
+  const other = randomUUID();
+  const parse = (entry: unknown) => parseCaseProtection(JSON.stringify({ types: { "company-policy": entry } }));
+
+  it("accepts mirrorKeys beside users and agentKeys, lowercased, on types and cases entries", () => {
+    const parsed = parse({ users: ["ray"], agentKeys: [other], mirrorKeys: [key.toUpperCase()] });
+    expect(parsed).toEqual({
+      status: "ok",
+      config: { types: { "company-policy": { users: ["ray"], agentKeys: [other], mirrorKeys: [key] } }, cases: {} },
+    });
+    const caseId = randomUUID();
+    const onCase = parseCaseProtection(JSON.stringify({ cases: { [caseId]: { mirrorKeys: [key] } } }));
+    expect(onCase.status).toBe("ok");
+  });
+
+  it("refuses the same UUID in agentKeys and mirrorKeys of one entry", () => {
+    expect(parse({ users: [], agentKeys: [key], mirrorKeys: [key.toUpperCase()] }).status).toBe("invalid");
+    // Different entries may each list it: a cases entry replaces the type's editors.
+    const caseId = randomUUID();
+    const split = parseCaseProtection(JSON.stringify({
+      types: { "company-policy": { agentKeys: [key] } },
+      cases: { [caseId]: { mirrorKeys: [key] } },
+    }));
+    expect(split.status).toBe("ok");
+  });
+
+  it("refuses a non-UUID or non-array mirrorKeys", () => {
+    for (const mirrorKeys of [["not-a-uuid"], "x", [1], [""]]) {
+      expect(parse({ users: [], agentKeys: [], mirrorKeys }).status, JSON.stringify(mirrorKeys)).toBe("invalid");
+    }
+  });
+
+  it("states mirrorKeys in the protected-cases header and in PATCHES.md", () => {
+    const header = readFileSync(new URL("../slashbin/protected-cases.ts", import.meta.url), "utf8").split("import type")[0]!;
+    expect(header).toContain("mirrorKeys");
+    expect(header).toContain("git-imported documents only");
+    const patches = readFileSync(new URL("../../../slashbin/PATCHES.md", import.meta.url), "utf8");
+    expect(patches).toContain("`mirrorKeys`");
+    expect(patches).toContain("mirror_write_refused");
+  });
+});
+
+describe("git-source-ref", () => {
+  const sha = "a".repeat(40);
+
+  it("parses only the importer's summary", () => {
+    expect(parseImportSummary(`import slashbin-io/repo/docs/a.md@${sha}`)).toEqual({ path: "slashbin-io/repo/docs/a.md", sha });
+    for (const bad of [
+      null, undefined, "", "first", `import slashbin-io/repo/docs/a.md@${sha.slice(0, 8)}`,
+      `import slashbin-io/repo/docs/a.md@${"A".repeat(40)}`, `import slashbin-io/repo/docs/a.md@${sha} extra`,
+      `Imported slashbin-io/repo/docs/a.md@${sha}`, `import docs/a.md@${sha}`, `import a//b/c@${sha}`,
+      "Restored from revision 1",
+    ]) {
+      expect(parseImportSummary(bad as string | null | undefined), String(bad)).toBeNull();
+    }
+  });
+
+  it("keyMatchesPath follows the manifest generator's key rule", () => {
+    const path = "xrgarcia/Slashbin-Ingest-Gateway/.claude/skills/clean-code/SKILL.md";
+    expect(keyMatchesPath("xrgarcia:Slashbin-Ingest-Gateway:.claude:skills:clean-code:SKILL.md", path)).toBe(true);
+    expect(keyMatchesPath("body", path)).toBe(false);
+    expect(keyMatchesPath("handoff-contract", "slashbin-io/em/process/contract.ts#BODY")).toBe(false);
+    // Characters outside [A-Za-z0-9_.:-] become "-".
+    expect(keyMatchesPath("o:r:my-doc-v2.md", "o/r/my doc(v2).md")).toBe(false);
+    expect(keyMatchesPath("o:r:my-doc-v2-.md", "o/r/my doc(v2).md")).toBe(true);
+    // Long paths: first 103 chars of the plain key, "-", first 16 hex of sha1(path).
+    const long = `o/r/${"d/".repeat(70)}file.md`;
+    const plain = long.replace(/\//g, ":");
+    const hashed = `${plain.slice(0, 103)}-${createHash("sha1").update(long).digest("hex").slice(0, 16)}`;
+    expect(keyMatchesPath(hashed, long)).toBe(true);
+    expect(keyMatchesPath(`${plain.slice(0, 103)}-${"0".repeat(16)}`, long)).toBe(false);
+    expect(keyMatchesPath(hashed, `${long}x`)).toBe(false);
+  });
+
+  it("blobSha equals git hash-object for ASCII, multibyte, empty and binary-ish content", () => {
+    for (const text of ["", "hello\n", "# Title\n\nbody without newline", "caf\u00e9 \u2014 \u{1F600}\n", "a\r\nb\0c"]) {
+      const real = execFileSync("git", ["hash-object", "--stdin"], { input: Buffer.from(text, "utf8") }).toString().trim();
+      expect(blobSha(text), JSON.stringify(text)).toBe(real);
+      expect(blobSha(Buffer.from(text, "utf8"))).toBe(real);
     }
   });
 });
@@ -484,6 +571,121 @@ describeEmbeddedPostgres("protected cases routes", () => {
     }
     const emptyEditors = JSON.stringify({ types: { "company-policy": { users: [], agentKeys: [] } } });
     await app(s.actors.raySession, emptyEditors).patch(`/api/cases/${s.policy.id}`).send({ title: "x" }).expect(403);
+  });
+
+  describe("mirror key", () => {
+    const PATH = "slashbin-io/repo/docs/runbook.md";
+    const DOC_KEY = "slashbin-io:repo:docs:runbook.md";
+    const BODY = "# Runbook\n\nsteps\n";
+    const gitSummary = (body: string, path = PATH) => `import ${path}@${blobSha(body)}`;
+
+    async function mirrorSeed() {
+      const s = await seed();
+      const mirrorKeyId = randomUUID();
+      const editors = { users: [RAY], agentKeys: [s.actors.poKey.keyId], mirrorKeys: [mirrorKeyId] };
+      const config = JSON.stringify({ types: { "company-policy": editors }, cases: { [s.fixture.id]: editors } });
+      const mirror: Actor = {
+        type: "agent", agentId: s.po.id, companyId: s.company.id, source: "agent_key", keyId: mirrorKeyId,
+        keyScope: { kind: "standard" },
+      };
+      const jwt: Actor = { type: "agent", agentId: s.po.id, companyId: s.company.id, source: "agent_jwt", runId: randomUUID() };
+      const bridge: Actor = { ...mirror, keyScope: { kind: "task_bridge", projectId: randomUUID() } } as Actor;
+      return { s, config, mirror, jwt, bridge, http: app(mirror, config), caseId: s.policy.id };
+    }
+
+    const put = (h: ReturnType<typeof app>, caseId: string, key: string, body: string, changeSummary: string, baseRevisionId?: string) =>
+      h.put(`/api/cases/${caseId}/documents/${key}`).send({ body, changeSummary, ...(baseRevisionId ? { baseRevisionId } : {}) });
+
+    it("PUTs and publishes a sha-matching git document, updating it by revision", async () => {
+      const { http, caseId } = await mirrorSeed();
+      const created = await put(http, caseId, DOC_KEY, BODY, gitSummary(BODY)).expect(200);
+      await http.post(`/api/cases/${caseId}/documents/${DOC_KEY}/publish`)
+        .send({ baseRevisionId: created.body.revision.id, changeSummary: "mirror" }).expect(200);
+      const next = `${BODY}more\n`;
+      const updated = await put(http, caseId, DOC_KEY, next, gitSummary(next), created.body.revision.id).expect(200);
+      const published = await http.post(`/api/cases/${caseId}/documents/${DOC_KEY}/publish`)
+        .send({ baseRevisionId: updated.body.revision.id, changeSummary: "mirror" }).expect(200);
+      expect(published.body.state).toBe("published");
+      expect(published.body.revisionId).toBe(updated.body.revision.id);
+    });
+
+    it("refuses with mirror_write_refused: policy key, sha mismatch, non-path key, bad summary", async () => {
+      const { http, caseId } = await mirrorSeed();
+      const refused = async (res: request.Test) => {
+        const r = await res;
+        expect(r.status).toBe(403);
+        expect(r.body.details?.code).toBe("mirror_write_refused");
+      };
+      await refused(put(http, caseId, "handoff-contract", BODY, gitSummary(BODY, "slashbin-io/em/process/contract.ts#BODY")));
+      await refused(put(http, caseId, "handoff-contract", BODY, gitSummary(BODY)));
+      await refused(put(http, caseId, DOC_KEY, BODY, gitSummary("different body")));
+      await refused(put(http, caseId, DOC_KEY, BODY, `import ${PATH}@${blobSha(BODY).slice(0, 8)}`));
+      await refused(put(http, caseId, DOC_KEY, BODY, "first"));
+      await refused(put(http, caseId, "body", BODY, gitSummary(BODY)));
+      expect(await db.select().from(caseDocuments).where(eq(caseDocuments.key, DOC_KEY))).toHaveLength(0);
+    });
+
+    it("refuses writes and publishes on a document whose history holds a non-import revision", async () => {
+      const { s, config, http, caseId } = await mirrorSeed();
+      // The seed's "body" document is Ray's. Even a well-formed import cannot be stacked on it.
+      const keyOnly = await app(s.actors.raySession, config);
+      const ray = await put(keyOnly, caseId, DOC_KEY, BODY, "hand edit").expect(200);
+      const r = await put(http, caseId, DOC_KEY, BODY, gitSummary(BODY), ray.body.revision.id);
+      expect(r.status).toBe(403);
+      expect(r.body.details?.code).toBe("mirror_write_refused");
+      // Publish judges the latest revision.
+      const p = await http.post(`/api/cases/${caseId}/documents/${DOC_KEY}/publish`)
+        .send({ baseRevisionId: ray.body.revision.id, changeSummary: "mirror" });
+      expect(p.status).toBe(403);
+      expect(p.body.details?.code).toBe("mirror_write_refused");
+      // A restore revision (non-import summary) in the history also locks the mirror out.
+      const editorImport = await put(keyOnly, caseId, "slashbin-io:repo:docs:b.md", BODY, gitSummary(BODY, "slashbin-io/repo/docs/b.md")).expect(200);
+      const edited = await put(keyOnly, caseId, "slashbin-io:repo:docs:b.md", "x", "edit", editorImport.body.revision.id).expect(200);
+      const bad = await put(http, caseId, "slashbin-io:repo:docs:b.md", BODY,
+        gitSummary(BODY, "slashbin-io/repo/docs/b.md"), edited.body.revision.id);
+      expect(bad.body.details?.code).toBe("mirror_write_refused");
+    });
+
+    it("is refused withdraw, delete and every other write route, and unlisted keys stay refused", async () => {
+      const { s, config, mirror, jwt, bridge, http, caseId } = await mirrorSeed();
+      const created = await put(http, caseId, DOC_KEY, BODY, gitSummary(BODY)).expect(200);
+      await http.post(`/api/cases/${caseId}/documents/${DOC_KEY}/publish`)
+        .send({ baseRevisionId: created.body.revision.id, changeSummary: "mirror" }).expect(200);
+      const before = await snapshot(caseId);
+      const denied = [
+        await http.post(`/api/cases/${caseId}/documents/${DOC_KEY}/withdraw`).send({ changeSummary: "x" }),
+        await http.delete(`/api/cases/${caseId}/documents/${DOC_KEY}`),
+        await http.post(`/api/cases/${caseId}/documents/${DOC_KEY}/lock`),
+        await http.patch(`/api/cases/${caseId}`).send({ title: "Hijacked" }),
+        await http.post(`/api/cases/${caseId}/documents/${DOC_KEY}/revisions/${created.body.revision.id}/restore`)
+          .send({ baseRevisionId: created.body.revision.id }),
+      ];
+      for (const res of denied) {
+        expect(res.status).toBe(403);
+        expect(res.body.details?.code).toBe("case_protected");
+      }
+      for (const actor of [jwt, bridge, s.actors.poMintedKey, s.actors.reader]) {
+        const res = await put(app(actor, config), caseId, `${DOC_KEY}-2`, BODY, gitSummary(BODY, `${PATH}-2`));
+        expect(res.status).toBe(403);
+        expect(res.body.details?.code).toBe("case_protected");
+      }
+      // Without being listed, the mirror key is an ordinary refused key.
+      const unlisted = await put(app(mirror, s.config), caseId, DOC_KEY, BODY, gitSummary(BODY));
+      expect(unlisted.body.details?.code).toBe("case_protected");
+      expect(await snapshot(caseId)).toEqual(before);
+    });
+
+    it("leaves users and agentKeys editors unchanged, and 503s on a mirror/agent overlap", async () => {
+      const { s, config, caseId } = await mirrorSeed();
+      for (const name of ["raySession", "poKey"] as const) {
+        const cur = await app(s.actors[name], config).get(`/api/cases/${caseId}/documents/body`).expect(200);
+        await put(app(s.actors[name], config), caseId, "body", `by ${name}`, "plain edit", cur.body.latestRevisionId).expect(200);
+      }
+      const overlap = JSON.stringify({ types: { "company-policy": { users: [RAY], agentKeys: [s.actors.poKey.keyId], mirrorKeys: [s.actors.poKey.keyId] } } });
+      const res = await put(app(s.actors.raySession, overlap), caseId, "body", "x", "x");
+      expect(res.status).toBe(503);
+      expect(res.body.details?.code).toBe("case_protection_unavailable");
+    });
   });
 
   it("refuses every case write with 503 when the config is invalid, and keeps reads", async () => {

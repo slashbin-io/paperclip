@@ -57,6 +57,9 @@ import {
   assertAttachmentAllowed,
   assertCaseProtectionAvailable,
   assertCaseWritable,
+  assertDocumentWritable,
+  assertMirrorHistory,
+  assertMirrorRevision,
   assertChangeSummary,
   assertDocumentDeletable,
   assertRestoreBase,
@@ -950,11 +953,16 @@ export function caseRoutes(db: Db, storage: StorageService) {
     const key = parseDocumentKey(req.params.key as string);
     const actor = getActorInfo(req);
     const body = upsertCaseDocumentSchema.parse(req.body);
-    assertCaseWritable(caseProtection, req, caseRow);
+    const writer = assertDocumentWritable(caseProtection, req, caseRow, { key });
     assertChangeSummary(caseProtection, caseRow, body.changeSummary);
+    if (writer === "mirror") assertMirrorRevision(caseRow, key, { changeSummary: body.changeSummary, body: body.body });
 
     const result = await db.transaction(async (tx) => {
       await lockCaseDocumentKey(tx, { companyId: caseRow.companyId, caseId: caseRow.id, key });
+      if (writer === "mirror") {
+        const held = await loadCaseDocumentLink(tx, { companyId: caseRow.companyId, caseId: caseRow.id, key });
+        if (held) await assertMirrorHistory(tx, caseRow, held.document.id, key);
+      }
       const existing = await tx
         .select({ link: caseDocuments, document: documents, revision: documentRevisions })
         .from(caseDocuments)
@@ -1142,7 +1150,10 @@ export function caseRoutes(db: Db, storage: StorageService) {
       if (!parsed.success) throw badRequest(`Invalid ${action} body`, parsed.error.issues);
       const body = parsed.data as { baseRevisionId?: string; changeSummary: string };
       assertCaseProtectionAvailable(caseProtection);
-      assertCaseWritable(caseProtection, req, caseRow);
+      // Publish admits a mirror key; withdraw keeps the editor-only gate.
+      const writer = action === "publish"
+        ? assertDocumentWritable(caseProtection, req, caseRow, { key })
+        : (assertCaseWritable(caseProtection, req, caseRow), "editor" as const);
       if (!isProtectedCase(caseProtection, caseRow)) {
         throw forbidden("Only documents of a protected case can be published", { code: "case_not_protected", caseId: caseRow.id });
       }
@@ -1152,6 +1163,16 @@ export function caseRoutes(db: Db, storage: StorageService) {
         await lockCaseDocumentKey(tx, { companyId: caseRow.companyId, caseId: caseRow.id, key });
         const link = await loadCaseDocumentLink(tx, { companyId: caseRow.companyId, caseId: caseRow.id, key });
         if (!link) throw notFound("Case document not found");
+        if (writer === "mirror") {
+          const [latest] = link.document.latestRevisionId
+            ? await tx.select({ changeSummary: documentRevisions.changeSummary, body: documentRevisions.body })
+              .from(documentRevisions)
+              .where(eq(documentRevisions.id, link.document.latestRevisionId))
+              .limit(1)
+            : [];
+          if (!latest) throw notFound("Case document has no revision");
+          assertMirrorRevision(caseRow, key, latest);
+        }
         const moved = action === "publish"
           ? await PublicationOwner.publish(tx, {
             document: link.document,
