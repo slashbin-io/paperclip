@@ -660,18 +660,24 @@ describeEmbeddedPostgres("protected cases routes", () => {
         .send({ baseRevisionId: latest.body.revision.id, changeSummary: "mirror" });
       expect(p.status).toBe(403);
       expect(p.body.details?.code).toBe("mirror_write_refused");
-      const [pub] = await db.select().from(documentPublications);
+      const [link] = await db.select().from(caseDocuments).where(eq(caseDocuments.key, DOC_KEY));
+      const [pub] = await db.select().from(documentPublications).where(eq(documentPublications.documentId, link!.documentId));
       expect(pub!.state).toBe("draft");
     });
 
     it("does not auto-link a Case to the task of the mirror key's run", async () => {
-      const { s, http, caseId } = await mirrorSeed();
+      const { s, config, mirror, caseId } = await mirrorSeed();
       const runId = randomUUID();
       await db.insert(heartbeatRuns).values({ id: runId, companyId: s.company.id, agentId: s.po.id, status: "running" });
       await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, s.issue.id));
-      await http.put(`/api/cases/${caseId}/documents/${DOC_KEY}`).set("X-Paperclip-Run-Id", runId)
-        .send({ body: BODY, changeSummary: gitSummary(BODY) }).expect(200);
+      // The test app injects the actor as-is, so the run id must be on the actor itself.
+      const runActor = { ...mirror, runId } as Actor;
+      await put(app(runActor, config), caseId, DOC_KEY, BODY, gitSummary(BODY)).expect(200);
       expect(await db.select().from(caseIssueLinks).where(eq(caseIssueLinks.caseId, caseId))).toHaveLength(0);
+      // Control: the same run on an editor does link, so the assertion above can fail.
+      await put(app({ ...s.actors.poKey, runId } as Actor, config), caseId, "body", "by po", "edit",
+        (await app(s.actors.poKey, config).get(`/api/cases/${caseId}/documents/body`).expect(200)).body.latestRevisionId).expect(200);
+      expect(await db.select().from(caseIssueLinks).where(eq(caseIssueLinks.caseId, caseId))).toHaveLength(1);
     });
 
     it("is refused withdraw, delete and every other write route, and unlisted keys stay refused", async () => {
