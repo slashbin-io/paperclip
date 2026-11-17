@@ -5,7 +5,7 @@
 // Pure functions, no I/O.
 import { createHash } from "node:crypto";
 
-const IMPORT_SUMMARY = /^import (\S+)@([0-9a-f]{40})$/;
+const IMPORT_SUMMARY = /^import (.+)@([0-9a-f]{40})$/;
 
 /** `import <owner>/<repo>/<path>@<40hex>` -> { path, sha }, or null when it is anything else. */
 export function parseImportSummary(summary: string | null | undefined): { path: string; sha: string } | null {

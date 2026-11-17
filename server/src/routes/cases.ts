@@ -1073,7 +1073,8 @@ export function caseRoutes(db: Db, storage: StorageService) {
         actor,
         payload: { key, documentId: document!.id, revisionId: revision!.id, revisionNumber: revision!.revisionNumber },
       });
-      await autoLinkRunIssue(tx, { companyId: caseRow.companyId, caseId: caseRow.id, actor, role: "work" });
+      // A mirror key may write the document, never a Case link: linking needs an editor.
+      if (writer !== "mirror") await autoLinkRunIssue(tx, { companyId: caseRow.companyId, caseId: caseRow.id, actor, role: "work" });
       return {
         // Slashbin (EM#629): carry `key` like restore does — the Case page keys its
         // document cache on it and crashes on an undefined one after a save.
@@ -1172,6 +1173,7 @@ export function caseRoutes(db: Db, storage: StorageService) {
             : [];
           if (!latest) throw notFound("Case document has no revision");
           assertMirrorRevision(caseRow, key, latest);
+          await assertMirrorHistory(tx, caseRow, link.document.id, key);
         }
         const moved = action === "publish"
           ? await PublicationOwner.publish(tx, {

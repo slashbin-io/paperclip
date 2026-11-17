@@ -21,6 +21,7 @@ import {
   createDb,
   documentAnnotationComments,
   documentAnnotationThreads,
+  documentPublications,
   documents,
   documentRevisions,
   heartbeatRuns,
@@ -120,11 +121,15 @@ describe("git-source-ref", () => {
     for (const bad of [
       null, undefined, "", "first", `import slashbin-io/repo/docs/a.md@${sha.slice(0, 8)}`,
       `import slashbin-io/repo/docs/a.md@${"A".repeat(40)}`, `import slashbin-io/repo/docs/a.md@${sha} extra`,
-      `Imported slashbin-io/repo/docs/a.md@${sha}`, `import docs/a.md@${sha}`, `import a//b/c@${sha}`,
+      `import slashbin-io/repo/docs/a.md@${sha}@${"b".repeat(39)}`, `Imported slashbin-io/repo/docs/a.md@${sha}`, `import docs/a.md@${sha}`, `import a//b/c@${sha}`,
       "Restored from revision 1",
     ]) {
       expect(parseImportSummary(bad as string | null | undefined), String(bad)).toBeNull();
     }
+  });
+
+  it("parses a path containing spaces", () => {
+    expect(parseImportSummary(`import o/r/my doc(v2).md@${sha}`)).toEqual({ path: "o/r/my doc(v2).md", sha });
   });
 
   it("keyMatchesPath follows the manifest generator's key rule", () => {
@@ -644,6 +649,29 @@ describeEmbeddedPostgres("protected cases routes", () => {
       const bad = await put(http, caseId, "slashbin-io:repo:docs:b.md", BODY,
         gitSummary(BODY, "slashbin-io/repo/docs/b.md"), edited.body.revision.id);
       expect(bad.body.details?.code).toBe("mirror_write_refused");
+    });
+
+    it("refuses publish when an older revision is manual, even with a valid latest import", async () => {
+      const { s, config, http, caseId } = await mirrorSeed();
+      const ray = app(s.actors.raySession, config);
+      const manual = await put(ray, caseId, DOC_KEY, "hand", "hand edit").expect(200);
+      const latest = await put(ray, caseId, DOC_KEY, BODY, gitSummary(BODY), manual.body.revision.id).expect(200);
+      const p = await http.post(`/api/cases/${caseId}/documents/${DOC_KEY}/publish`)
+        .send({ baseRevisionId: latest.body.revision.id, changeSummary: "mirror" });
+      expect(p.status).toBe(403);
+      expect(p.body.details?.code).toBe("mirror_write_refused");
+      const [pub] = await db.select().from(documentPublications);
+      expect(pub!.state).toBe("draft");
+    });
+
+    it("does not auto-link a Case to the task of the mirror key's run", async () => {
+      const { s, http, caseId } = await mirrorSeed();
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: s.company.id, agentId: s.po.id, status: "running" });
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, s.issue.id));
+      await http.put(`/api/cases/${caseId}/documents/${DOC_KEY}`).set("X-Paperclip-Run-Id", runId)
+        .send({ body: BODY, changeSummary: gitSummary(BODY) }).expect(200);
+      expect(await db.select().from(caseIssueLinks).where(eq(caseIssueLinks.caseId, caseId))).toHaveLength(0);
     });
 
     it("is refused withdraw, delete and every other write route, and unlisted keys stay refused", async () => {
