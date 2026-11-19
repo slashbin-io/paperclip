@@ -15,6 +15,7 @@ SERVER_FILES=(
   middleware/comment-only-key.ts
   routes/issues.ts
   routes/cases.ts
+  routes/cases-schemas.ts
   slashbin/protected-cases.ts
   slashbin/git-source-ref.ts
   slashbin/document-publications.ts

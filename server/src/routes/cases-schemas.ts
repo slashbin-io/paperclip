@@ -60,7 +60,9 @@ export const upsertCaseDocumentSchema = z
   .object({
     title: z.string().trim().min(1).max(200).optional(),
     format: z.string().trim().min(1).max(80).optional().default("markdown"),
-    body: z.string().max(200_000),
+    // Slashbin (paperclip#27): the cap issue documents already apply to the same
+    // documents table; upstream #13038 set 200_000, below a living PO roadmap.
+    body: z.string().max(524_288),
     changeSummary: z.string().trim().max(1_000).nullable().optional(),
     baseRevisionId: z.string().guid().nullable().optional(),
   })
