@@ -30,6 +30,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { DEFAULT_JSON_BODY_LIMIT } from "../http/body-limits.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { buildCasePatchUpdateValues, caseRoutes } from "../routes/cases.js";
@@ -122,7 +123,7 @@ describeEmbeddedPostgres("cases routes", () => {
 
   function app(actor: Express.Request["actor"]) {
     const instance = express();
-    instance.use(express.json());
+    instance.use(express.json({ limit: DEFAULT_JSON_BODY_LIMIT }));
     instance.use((req, _res, next) => {
       req.actor = actor;
       next();
@@ -764,6 +765,29 @@ describeEmbeddedPostgres("cases routes", () => {
     await http.get(`/api/cases/${created.body.id}`).expect(200).expect((res) => {
       expect(res.body.documents).toHaveLength(0);
     });
+  });
+
+  it("caps a case document body at 524,288 characters, the issue-document cap", async () => {
+    await enableCases();
+    const company = await seedCompany("CAP");
+    const http = request(app(boardActor));
+    const created = await http
+      .post(`/api/companies/${company.id}/cases`)
+      .send({ caseType: "blog_post", title: "Document cap" })
+      .expect(201);
+
+    const accepted = "a".repeat(300_000);
+    await http.put(`/api/cases/${created.body.id}/documents/body`).send({ body: accepted }).expect(200);
+    const loaded = await http.get(`/api/cases/${created.body.id}/documents/body`).expect(200);
+    expect(loaded.body.body).toHaveLength(300_000);
+
+    const rejected = await http
+      .put(`/api/cases/${created.body.id}/documents/body`)
+      .send({ body: "a".repeat(524_289) })
+      .expect(400);
+    expect(rejected.body.details).toEqual([
+      expect.objectContaining({ code: "too_big", maximum: 524_288, path: ["body"] }),
+    ]);
   });
 
   it("creates, replies to, resolves, reopens, and remaps case document annotations", async () => {
