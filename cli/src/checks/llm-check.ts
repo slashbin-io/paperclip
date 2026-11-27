@@ -20,20 +20,13 @@ export async function llmCheck(config: PaperclipConfig): Promise<CheckResult> {
 
   try {
     if (config.llm.provider === "claude") {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
+      const res = await fetch("https://api.anthropic.com/v1/models", {
         headers: {
           "x-api-key": config.llm.apiKey,
           "anthropic-version": "2023-06-01",
-          "content-type": "application/json",
         },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-5-20250929",
-          max_tokens: 1,
-          messages: [{ role: "user", content: "hi" }],
-        }),
       });
-      if (res.ok || res.status === 400) {
+      if (res.ok) {
         return { name: "LLM provider", status: "pass", message: "Claude API key is valid" };
       }
       if (res.status === 401) {
