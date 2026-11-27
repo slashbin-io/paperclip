@@ -19,9 +19,15 @@ const BEDROCK_MODELS: AdapterModel[] = [
   { id: "us.anthropic.claude-opus-4-7", label: "Bedrock Opus 4.7" },
   { id: "us.anthropic.claude-sonnet-4-6", label: "Bedrock Sonnet 4.6" },
   { id: "us.anthropic.claude-opus-4-6-v1", label: "Bedrock Opus 4.6" },
-  { id: "us.anthropic.claude-sonnet-4-5-20250929-v2:0", label: "Bedrock Sonnet 4.5" },
   { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", label: "Bedrock Haiku 4.5" },
 ];
+
+/** Model ID prefixes Anthropic has retired; live discovery must not re-offer them. */
+const RETIRED_MODEL_ID_PREFIXES = ["claude-sonnet-4-5"];
+
+function withoutRetiredModels(models: AdapterModel[]): AdapterModel[] {
+  return models.filter((model) => !RETIRED_MODEL_ID_PREFIXES.some((prefix) => model.id.trim().startsWith(prefix)));
+}
 
 let cached: { keyFingerprint: string; baseUrl: string; expiresAt: number; models: AdapterModel[] } | null = null;
 
@@ -52,10 +58,10 @@ function dedupeModels(models: AdapterModel[]): AdapterModel[] {
 }
 
 function mergedWithFallback(models: AdapterModel[]): AdapterModel[] {
-  return dedupeModels([
+  return dedupeModels(withoutRetiredModels([
     ...models,
     ...DIRECT_MODELS,
-  ]);
+  ]));
 }
 
 function resolveAnthropicApiKey(): string | null {
